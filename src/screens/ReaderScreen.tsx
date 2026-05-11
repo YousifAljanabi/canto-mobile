@@ -5,9 +5,9 @@ import {
   Pressable,
   StyleSheet,
   ActivityIndicator,
-  SafeAreaView,
   TouchableOpacity,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Slider from '@react-native-community/slider';
@@ -29,6 +29,7 @@ export default function ReaderScreen() {
   const route = useRoute<Route>();
   const navigation = useNavigation<Nav>();
   const { filePath } = route.params;
+  const insets = useSafeAreaInsets();
 
   const [book, setBook] = useState<ParsedBook | null>(null);
   const [loading, setLoading] = useState(true);
@@ -246,8 +247,8 @@ export default function ReaderScreen() {
   const durPerItem = (currentChapter?.durationEstimate ?? 0) / Math.max(1, textItems.length);
 
   return (
-    <SafeAreaView style={styles.safe}>
-      <View style={styles.topBar}>
+    <View style={styles.safe}>
+      <View style={[styles.topBar, { paddingTop: insets.top + 6 }]}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
           <Text style={styles.backIcon}>‹</Text>
         </TouchableOpacity>
@@ -307,7 +308,7 @@ export default function ReaderScreen() {
         </TouchableOpacity>
       </View>
 
-      <View style={styles.bookProgressSection}>
+      <View style={[styles.bookProgressSection, { paddingBottom: insets.bottom + 8 }]}>
         <View style={styles.bookProgressRow}>
           <Text style={styles.bookProgressLabel}>book</Text>
           <Text style={styles.bookProgressPct}>{Math.round(bookProgress * 100)}%</Text>
@@ -335,7 +336,7 @@ export default function ReaderScreen() {
         onPitchChange={handlePitchChange}
         onClose={() => setShowVoice(false)}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 

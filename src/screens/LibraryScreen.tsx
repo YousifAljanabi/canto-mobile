@@ -9,9 +9,9 @@ import {
   Image,
   RefreshControl,
   ActivityIndicator,
-  SafeAreaView,
   TouchableOpacity,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as DocumentPicker from 'expo-document-picker';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -47,6 +47,7 @@ function BookCard({ entry, onPress, onLongPress }: { entry: LibraryEntry; onPres
 
 export default function LibraryScreen() {
   const navigation = useNavigation<Nav>();
+  const insets = useSafeAreaInsets();
   const [library, setLibrary] = useState<LibraryEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -128,8 +129,8 @@ export default function LibraryScreen() {
   }
 
   return (
-    <SafeAreaView style={styles.safe}>
-      <View style={styles.header}>
+    <View style={styles.safe}>
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
         <Text style={styles.logo}>canto.</Text>
         <TouchableOpacity style={styles.addBtn} onPress={pickEpub} disabled={loading}>
           {loading ? (
@@ -171,7 +172,7 @@ export default function LibraryScreen() {
           />
         </>
       )}
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -187,7 +188,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 20,
-    paddingTop: 8,
     paddingBottom: 16,
   },
   logo: {

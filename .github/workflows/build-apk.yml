@@ -1,0 +1,27 @@
+name: Build & Distribute APK
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Trigger server build
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 159.195.41.12
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          timeout: 25m
+          script: |
+            export GH_TOKEN="${{ secrets.GH_TOKEN }}"
+            export GITHUB_REPOSITORY="${{ github.repository }}"
+            export GITHUB_REF_NAME="${{ github.ref_name }}"
+            export TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+            export TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
+            /opt/canto-build/build.sh
