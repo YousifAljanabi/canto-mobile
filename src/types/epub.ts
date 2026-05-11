@@ -6,12 +6,19 @@ export interface TocEntry {
   children?: TocEntry[];
 }
 
+export type TextItem  = { type: 'text';  content: string };
+export type CodeItem  = { type: 'code';  content: string; language?: string };
+export type TableItem = { type: 'table'; rows: string[][] };
+export type ImageItem = { type: 'image'; base64: string; mimeType: string; alt?: string };
+
+export type ContentItem = TextItem | CodeItem | TableItem | ImageItem;
+
 export interface Chapter {
   id: string;
   title: string;
   href: string;
-  paragraphs: string[];
-  durationEstimate?: number; // seconds, rough estimate
+  items: ContentItem[];
+  durationEstimate?: number;
 }
 
 export interface BookMetadata {
@@ -30,5 +37,16 @@ export interface ParsedBook {
 
 export interface ReadingPosition {
   chapterIndex: number;
-  paragraphIndex: number;
+  itemIndex: number;
+}
+
+export function isSpoken(item: ContentItem): item is TextItem {
+  return item.type === 'text';
+}
+
+export function nextTextIndex(items: ContentItem[], from: number): number {
+  for (let i = from; i < items.length; i++) {
+    if (items[i].type === 'text') return i;
+  }
+  return -1;
 }

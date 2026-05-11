@@ -2,7 +2,7 @@ import * as LegacyFS from 'expo-file-system/legacy';
 import JSZip from 'jszip';
 import { XMLParser } from 'fast-xml-parser';
 import { parseDocument } from 'htmlparser2';
-import { Chapter, ParsedBook, TocEntry, BookMetadata } from '../types/epub';
+import { Chapter, ContentItem, ParsedBook, TocEntry, BookMetadata } from '../types/epub';
 
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
@@ -15,12 +15,11 @@ function getText(node: any): string {
   return children.map(getText).join('');
 }
 
-// ~2 sentences per TTS chunk — fast server response, Spotify-sized lines
+// ─── Text chunking ──────────────────────────────────────────────────────────
+
 const MAX_CHUNK = 220;
 
 function splitSentences(text: string): string[] {
-  // Split on . ! ? followed by space+capital or end of string
-  // Handles abbreviations poorly but good enough for prose
   return text
     .split(/(?<=[.!?]["']?)\s+(?=[A-Z"'])|(?<=[.!?])\s*$/)
     .map(s => s.trim())
@@ -44,7 +43,7 @@ function splitIntoChunks(text: string): string[] {
     }
   }
   if (current.trim()) chunks.push(current.trim());
-  // If a single sentence exceeded MAX_CHUNK, hard-split at word boundary
+
   return chunks.flatMap(c => {
     if (c.length <= MAX_CHUNK) return [c];
     const parts: string[] = [];
@@ -60,43 +59,118 @@ function splitIntoChunks(text: string): string[] {
   });
 }
 
-function extractParagraphs(html: string): string[] {
-  const dom = parseDocument(html);
-  const raw: string[] = [];
+// ─── Node helpers ───────────────────────────────────────────────────────────
 
+function extractText(node: any): string {
+  if (!node) return '';
+  if (node.type === 'text') return node.data ?? '';
+  if (node.children) return node.children.map(extractText).join('');
+  return '';
+}
+
+function extractTableRows(tableNode: any): string[][] {
+  const rows: string[][] = [];
   function walk(node: any) {
     if (!node) return;
-    if (node.type === 'tag' && ['h1','h2','h3','h4','h5','h6'].includes(node.name)) return;
-    if (node.type === 'tag' && ['p', 'div', 'section', 'blockquote'].includes(node.name)) {
-      const text = extractText(node).trim();
-      if (text.length > 20) {
-        raw.push(text);
-        return;
-      }
+    if (node.type === 'tag' && node.name === 'tr') {
+      const cells = (node.children ?? [])
+        .filter((c: any) => c.type === 'tag' && (c.name === 'td' || c.name === 'th'))
+        .map((c: any) => extractText(c).replace(/\s+/g, ' ').trim());
+      if (cells.length > 0) rows.push(cells);
+      return;
     }
     if (node.children) node.children.forEach(walk);
   }
-
-  function extractText(node: any): string {
-    if (!node) return '';
-    if (node.type === 'text') return node.data ?? '';
-    if (node.children) return node.children.map(extractText).join('');
-    return '';
-  }
-
-  dom.children.forEach(walk);
-
-  if (raw.length === 0) {
-    const plainText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-    raw.push(...plainText.split(/\.\s+/).filter(s => s.length > 20).map(s => s.trim() + '.'));
-  }
-
-  // Split any oversized paragraphs into sentence-level chunks
-  // Filter headings (h1-h6 content tends to be short with no sentence-ending punctuation)
-  return raw
-    .filter(t => t.length > 20)
-    .flatMap(splitIntoChunks);
+  walk(tableNode);
+  return rows;
 }
+
+// ─── Main content extractor ─────────────────────────────────────────────────
+
+type ImageResolver = (src: string) => Promise<{ base64: string; mimeType: string } | null>;
+
+async function extractContent(html: string, resolveImage: ImageResolver): Promise<ContentItem[]> {
+  const dom = parseDocument(html);
+  const items: ContentItem[] = [];
+
+  async function walk(node: any): Promise<void> {
+    if (!node) return;
+    if (node.type !== 'tag') return;
+
+    const tag = node.name as string;
+
+    // Skip nav/header/footer clutter
+    if (['nav', 'header', 'footer', 'script', 'style'].includes(tag)) return;
+
+    // Headings — skip from spoken content, don't render separately
+    if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tag)) return;
+
+    // Code blocks
+    if (tag === 'pre') {
+      const code = extractText(node).replace(/\n{3,}/g, '\n\n').trim();
+      if (code) {
+        const langClass: string = node.attribs?.class ?? '';
+        const language = langClass.match(/language-(\w+)/)?.[1];
+        items.push({ type: 'code', content: code, language });
+      }
+      return;
+    }
+
+    // Tables
+    if (tag === 'table') {
+      const rows = extractTableRows(node);
+      if (rows.length > 0) items.push({ type: 'table', rows });
+      return;
+    }
+
+    // Images
+    if (tag === 'img') {
+      const src: string = node.attribs?.src ?? node.attribs?.['xlink:href'] ?? '';
+      const alt: string = node.attribs?.alt ?? '';
+      if (src) {
+        const img = await resolveImage(src);
+        if (img) items.push({ type: 'image', ...img, alt });
+      }
+      return;
+    }
+
+    // Block elements — extract text as spoken paragraphs
+    if (['p', 'blockquote', 'li'].includes(tag)) {
+      // Don't descend into children that contain code/table/img — handle those separately
+      const hasRichChild = (node.children ?? []).some((c: any) =>
+        c.type === 'tag' && ['pre', 'table', 'img'].includes(c.name)
+      );
+      if (hasRichChild) {
+        for (const child of node.children ?? []) await walk(child);
+        return;
+      }
+      const text = extractText(node).replace(/\s+/g, ' ').trim();
+      if (text.length > 20) {
+        splitIntoChunks(text).forEach(chunk =>
+          items.push({ type: 'text', content: chunk })
+        );
+      }
+      return;
+    }
+
+    // Recurse into containers
+    for (const child of node.children ?? []) await walk(child);
+  }
+
+  for (const child of dom.children) await walk(child as any);
+
+  // Fallback: plain text if nothing extracted
+  if (items.length === 0) {
+    const plain = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    plain.split(/\.\s+/).filter(s => s.length > 20).forEach(s =>
+      items.push({ type: 'text', content: s.trim() + '.' })
+    );
+  }
+
+  return items;
+}
+
+// ─── Path helpers ───────────────────────────────────────────────────────────
 
 function resolvePath(base: string, relative: string): string {
   if (relative.startsWith('/')) return relative.slice(1);
@@ -113,11 +187,12 @@ async function readFileAsBase64(filePath: string): Promise<string> {
   return await LegacyFS.readAsStringAsync(filePath, { encoding: LegacyFS.EncodingType.Base64 });
 }
 
+// ─── Main parser ────────────────────────────────────────────────────────────
+
 export async function parseEpub(filePath: string): Promise<ParsedBook> {
   const base64 = await readFileAsBase64(filePath);
   const zip = await JSZip.loadAsync(base64, { base64: true });
 
-  // Find container.xml
   const containerXml = await zip.file('META-INF/container.xml')?.async('string');
   if (!containerXml) throw new Error('Invalid epub: missing container.xml');
 
@@ -125,7 +200,6 @@ export async function parseEpub(filePath: string): Promise<ParsedBook> {
   const rootfilePath =
     containerParsed?.container?.rootfiles?.rootfile?.['@_full-path'] ??
     containerParsed?.container?.rootfiles?.rootfile?.[0]?.['@_full-path'];
-
   if (!rootfilePath) throw new Error('Invalid epub: cannot find OPF path');
 
   const opfXml = await zip.file(rootfilePath)?.async('string');
@@ -134,7 +208,6 @@ export async function parseEpub(filePath: string): Promise<ParsedBook> {
   const opf = xmlParser.parse(opfXml);
   const pkg = opf?.package ?? opf?.['opf:package'] ?? opf;
 
-  // Metadata
   const metaRaw = pkg?.metadata ?? pkg?.['opf:metadata'] ?? {};
   const metadata: BookMetadata = {
     title: getText(metaRaw['dc:title']) || 'Unknown Title',
@@ -142,47 +215,73 @@ export async function parseEpub(filePath: string): Promise<ParsedBook> {
     language: getText(metaRaw['dc:language']) || 'en',
   };
 
-  // Cover image
   const manifest = pkg?.manifest ?? pkg?.['opf:manifest'] ?? {};
-  const items: any[] = Array.isArray(manifest?.item) ? manifest.item : [manifest?.item].filter(Boolean);
-  const coverItem = items.find(
-    it => it?.['@_media-type']?.startsWith('image/') && (it?.['@_id'] === 'cover' || it?.['@_properties'] === 'cover-image')
+  const manifestItems: any[] = Array.isArray(manifest?.item)
+    ? manifest.item
+    : [manifest?.item].filter(Boolean);
+
+  const opfDir = rootfilePath.includes('/')
+    ? rootfilePath.slice(0, rootfilePath.lastIndexOf('/') + 1)
+    : '';
+
+  const coverItem = manifestItems.find(
+    it => it?.['@_media-type']?.startsWith('image/') &&
+      (it?.['@_id'] === 'cover' || it?.['@_properties'] === 'cover-image')
   );
   if (coverItem) {
-    const opfDir = rootfilePath.includes('/') ? rootfilePath.slice(0, rootfilePath.lastIndexOf('/') + 1) : '';
     const coverPath = opfDir + coverItem['@_href'];
     const coverFile = zip.file(coverPath) ?? zip.file(decodeURIComponent(coverPath));
-    if (coverFile) {
-      metadata.coverImageBase64 = await coverFile.async('base64');
-    }
+    if (coverFile) metadata.coverImageBase64 = await coverFile.async('base64');
   }
 
-  // Spine order
+  // Image resolver — looks up images relative to the chapter file
+  function makeImageResolver(chapterDir: string): ImageResolver {
+    return async (src: string) => {
+      if (src.startsWith('data:')) {
+        const match = src.match(/^data:(image\/\w+);base64,(.+)/);
+        if (match) return { mimeType: match[1], base64: match[2] };
+        return null;
+      }
+      const cleaned = src.split('?')[0].split('#')[0];
+      const candidates = [
+        resolvePath(chapterDir + 'x', cleaned),
+        opfDir + cleaned,
+        cleaned,
+      ];
+      for (const p of candidates) {
+        const f = zip.file(p) ?? zip.file(decodeURIComponent(p));
+        if (f) {
+          const b64 = await f.async('base64');
+          const ext = p.split('.').pop()?.toLowerCase() ?? 'jpeg';
+          const mimeMap: Record<string, string> = {
+            jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+            gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+          };
+          return { base64: b64, mimeType: mimeMap[ext] ?? 'image/jpeg' };
+        }
+      }
+      return null;
+    };
+  }
+
   const spine = pkg?.spine ?? pkg?.['opf:spine'] ?? {};
-  const spineItems: any[] = Array.isArray(spine?.itemref) ? spine.itemref : [spine?.itemref].filter(Boolean);
+  const spineItems: any[] = Array.isArray(spine?.itemref)
+    ? spine.itemref
+    : [spine?.itemref].filter(Boolean);
   const spineIds = spineItems.map(it => it?.['@_idref']).filter(Boolean);
 
   const itemMap = new Map<string, any>();
-  items.forEach(it => { if (it?.['@_id']) itemMap.set(it['@_id'], it); });
+  manifestItems.forEach(it => { if (it?.['@_id']) itemMap.set(it['@_id'], it); });
 
-  // TOC — try nav.xhtml (epub3) then toc.ncx (epub2)
-  const navItem = items.find(it => it?.['@_properties'] === 'nav');
-  const ncxItem = items.find(it => it?.['@_media-type'] === 'application/x-dtbncx+xml');
-  const opfDir = rootfilePath.includes('/') ? rootfilePath.slice(0, rootfilePath.lastIndexOf('/') + 1) : '';
-
+  const navItem = manifestItems.find(it => it?.['@_properties'] === 'nav');
+  const ncxItem = manifestItems.find(it => it?.['@_media-type'] === 'application/x-dtbncx+xml');
   let toc: TocEntry[] = [];
-
   if (navItem) {
-    const navPath = opfDir + navItem['@_href'];
-    const navHtml = await zip.file(navPath)?.async('string') ?? '';
-    toc = parseNavToc(navHtml);
+    toc = parseNavToc(await zip.file(opfDir + navItem['@_href'])?.async('string') ?? '');
   } else if (ncxItem) {
-    const ncxPath = opfDir + ncxItem['@_href'];
-    const ncxXml = await zip.file(ncxPath)?.async('string') ?? '';
-    toc = parseNcxToc(ncxXml);
+    toc = parseNcxToc(await zip.file(opfDir + ncxItem['@_href'])?.async('string') ?? '');
   }
 
-  // Parse chapters in spine order
   const chapters: Chapter[] = [];
   for (const idref of spineIds) {
     const item = itemMap.get(idref);
@@ -192,63 +291,61 @@ export async function parseEpub(filePath: string): Promise<ParsedBook> {
     if (!chapterFile) continue;
 
     const html = await chapterFile.async('string');
-    const paragraphs = extractParagraphs(html);
-    if (paragraphs.length === 0) continue;
+    const chapterDir = chapterPath.includes('/')
+      ? chapterPath.slice(0, chapterPath.lastIndexOf('/') + 1)
+      : '';
 
-    const tocEntry = toc.find(t => t.href === item['@_href'] || t.href.split('#')[0] === item['@_href']);
+    const items = await extractContent(html, makeImageResolver(chapterDir));
+    const textItems = items.filter(i => i.type === 'text');
+    if (textItems.length === 0) continue;
+
+    const tocEntry = toc.find(t =>
+      t.href === item['@_href'] || t.href.split('#')[0] === item['@_href']
+    );
     const chTitle = tocEntry?.title ?? `Chapter ${chapters.length + 1}`;
-    const wordCount = paragraphs.reduce((acc, p) => acc + p.split(' ').length, 0);
-    // ~150 wpm average TTS speed
-    const durationEstimate = Math.round((wordCount / 150) * 60);
+    const wordCount = textItems.reduce((acc, i) =>
+      acc + (i.type === 'text' ? i.content.split(' ').length : 0), 0
+    );
 
     chapters.push({
       id: item['@_id'],
       title: chTitle,
       href: item['@_href'],
-      paragraphs,
-      durationEstimate,
+      items,
+      durationEstimate: Math.round((wordCount / 150) * 60),
     });
   }
 
   return { metadata, chapters, toc, filePath };
 }
 
+// ─── TOC parsers ─────────────────────────────────────────────────────────────
+
 function parseNavToc(html: string): TocEntry[] {
   const entries: TocEntry[] = [];
   const dom = parseDocument(html);
-  let idCounter = 0;
+  let id = 0;
 
   function findNav(node: any): any {
     if (!node) return null;
     if (node.type === 'tag' && node.name === 'nav') return node;
-    if (node.children) {
-      for (const c of node.children) {
-        const found = findNav(c);
-        if (found) return found;
-      }
-    }
+    for (const c of node.children ?? []) { const f = findNav(c); if (f) return f; }
     return null;
   }
 
-  function extractText(node: any): string {
+  function nodeText(node: any): string {
     if (!node) return '';
     if (node.type === 'text') return node.data ?? '';
-    if (node.children) return node.children.map(extractText).join('').trim();
-    return '';
+    return (node.children ?? []).map(nodeText).join('').trim();
   }
 
   function parseOl(ol: any, level = 0) {
-    if (!ol?.children) return;
-    for (const li of ol.children) {
+    for (const li of ol.children ?? []) {
       if (li.type !== 'tag' || li.name !== 'li') continue;
       const a = li.children?.find((c: any) => c.type === 'tag' && c.name === 'a');
-      if (a) {
-        const href = a.attribs?.href ?? '';
-        const title = extractText(a);
-        entries.push({ id: String(idCounter++), title, href, level });
-      }
-      const subOl = li.children?.find((c: any) => c.type === 'tag' && c.name === 'ol');
-      if (subOl) parseOl(subOl, level + 1);
+      if (a) entries.push({ id: String(id++), title: nodeText(a), href: a.attribs?.href ?? '', level });
+      const sub = li.children?.find((c: any) => c.type === 'tag' && c.name === 'ol');
+      if (sub) parseOl(sub, level + 1);
     }
   }
 
@@ -257,7 +354,6 @@ function parseNavToc(html: string): TocEntry[] {
     const ol = nav.children?.find((c: any) => c.type === 'tag' && c.name === 'ol');
     if (ol) parseOl(ol);
   }
-
   return entries;
 }
 
@@ -266,14 +362,14 @@ function parseNcxToc(xml: string): TocEntry[] {
   const ncx = parsed?.ncx ?? parsed;
   const navMap = ncx?.navMap ?? {};
   const entries: TocEntry[] = [];
-  let idCounter = 0;
+  let id = 0;
 
   function parseNavPoints(points: any, level = 0) {
     const arr = Array.isArray(points) ? points : [points].filter(Boolean);
     for (const pt of arr) {
       const title = getText(pt?.navLabel?.text ?? pt?.['ncx:navLabel']?.['ncx:text']) || 'Section';
       const href = pt?.content?.['@_src'] ?? pt?.['ncx:content']?.['@_src'] ?? '';
-      entries.push({ id: String(idCounter++), title, href, level });
+      entries.push({ id: String(id++), title, href, level });
       const sub = pt?.navPoint ?? pt?.['ncx:navPoint'];
       if (sub) parseNavPoints(sub, level + 1);
     }
@@ -281,6 +377,5 @@ function parseNcxToc(xml: string): TocEntry[] {
 
   const rawPoints = navMap?.navPoint ?? navMap?.['ncx:navPoint'];
   if (rawPoints) parseNavPoints(rawPoints);
-
   return entries;
 }
