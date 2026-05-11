@@ -126,17 +126,37 @@ interface Props {
   onItemPress?: (index: number) => void;
 }
 
+const INACTIVITY_MS = 5000;
+
 export default function LyricsView({ items, activeIndex, fontSize = 18, onItemPress }: Props) {
   const listRef = useRef<FlatList>(null);
+  const inactivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const userScrolling = useRef(false);
 
+  const scrollToActive = (idx: number, animated = true) => {
+    const clamped = Math.min(Math.max(0, idx || 0), items.length - 1);
+    if (!Number.isFinite(clamped) || items.length === 0) return;
+    listRef.current?.scrollToIndex({ index: clamped, animated, viewPosition: 0.35 });
+  };
+
+  const resetInactivityTimer = () => {
+    if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    inactivityTimer.current = setTimeout(() => {
+      userScrolling.current = false;
+      scrollToActive(activeIndex);
+    }, INACTIVITY_MS);
+  };
+
+  // Auto-scroll when active index changes (only if user isn't scrolling)
   useEffect(() => {
-    if (items.length === 0) return;
-    const idx = Math.min(Math.max(0, activeIndex || 0), items.length - 1);
-    if (!Number.isFinite(idx)) return;
-    setTimeout(() => {
-      listRef.current?.scrollToIndex({ index: idx, animated: true, viewPosition: 0.35 });
-    }, 80);
+    if (userScrolling.current) return;
+    setTimeout(() => scrollToActive(activeIndex), 80);
   }, [activeIndex, items.length]);
+
+  // Cleanup timer on unmount
+  useEffect(() => {
+    return () => { if (inactivityTimer.current) clearTimeout(inactivityTimer.current); };
+  }, []);
 
   return (
     <FlatList
@@ -156,6 +176,12 @@ export default function LyricsView({ items, activeIndex, fontSize = 18, onItemPr
       )}
       contentContainerStyle={styles.listContent}
       showsVerticalScrollIndicator={false}
+      onScrollBeginDrag={() => {
+        userScrolling.current = true;
+        resetInactivityTimer();
+      }}
+      onMomentumScrollEnd={resetInactivityTimer}
+      onScrollEndDrag={resetInactivityTimer}
       onScrollToIndexFailed={info => {
         setTimeout(() => {
           listRef.current?.scrollToIndex({
