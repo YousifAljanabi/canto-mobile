@@ -15,17 +15,38 @@ function getText(node: any): string {
   return children.map(getText).join('');
 }
 
+// Max chars per TTS chunk — keeps server latency under ~2s
+const MAX_CHUNK = 400;
+
+function splitIntoChunks(text: string): string[] {
+  if (text.length <= MAX_CHUNK) return [text];
+  // Split on sentence boundaries
+  const sentences = text.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g) ?? [text];
+  const chunks: string[] = [];
+  let current = '';
+  for (const s of sentences) {
+    if ((current + s).length > MAX_CHUNK && current) {
+      chunks.push(current.trim());
+      current = s;
+    } else {
+      current += s;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
+}
+
 function extractParagraphs(html: string): string[] {
   const dom = parseDocument(html);
-  const paras: string[] = [];
+  const raw: string[] = [];
 
   function walk(node: any) {
     if (!node) return;
     if (node.type === 'tag' && ['p', 'div', 'section', 'blockquote'].includes(node.name)) {
       const text = extractText(node).trim();
       if (text.length > 20) {
-        paras.push(text);
-        return; // don't recurse into block elements we captured
+        raw.push(text);
+        return;
       }
     }
     if (node.children) node.children.forEach(walk);
@@ -40,13 +61,13 @@ function extractParagraphs(html: string): string[] {
 
   dom.children.forEach(walk);
 
-  // Fallback: if no paragraphs found, split by double newlines
-  if (paras.length === 0) {
+  if (raw.length === 0) {
     const plainText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-    return plainText.split(/\.\s+/).filter(s => s.length > 20).map(s => s.trim() + '.');
+    raw.push(...plainText.split(/\.\s+/).filter(s => s.length > 20).map(s => s.trim() + '.'));
   }
 
-  return paras;
+  // Split any oversized paragraphs into sentence-level chunks
+  return raw.flatMap(splitIntoChunks);
 }
 
 function resolvePath(base: string, relative: string): string {
