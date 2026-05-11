@@ -15,25 +15,49 @@ function getText(node: any): string {
   return children.map(getText).join('');
 }
 
-// Max chars per TTS chunk — keeps server latency under ~2s
-const MAX_CHUNK = 400;
+// ~2 sentences per TTS chunk — fast server response, Spotify-sized lines
+const MAX_CHUNK = 220;
+
+function splitSentences(text: string): string[] {
+  // Split on . ! ? followed by space+capital or end of string
+  // Handles abbreviations poorly but good enough for prose
+  return text
+    .split(/(?<=[.!?]["']?)\s+(?=[A-Z"'])|(?<=[.!?])\s*$/)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+}
 
 function splitIntoChunks(text: string): string[] {
-  if (text.length <= MAX_CHUNK) return [text];
-  // Split on sentence boundaries
-  const sentences = text.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g) ?? [text];
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= MAX_CHUNK) return [normalized];
+
+  const sentences = splitSentences(normalized);
   const chunks: string[] = [];
   let current = '';
+
   for (const s of sentences) {
-    if ((current + s).length > MAX_CHUNK && current) {
+    if (current && (current + ' ' + s).length > MAX_CHUNK) {
       chunks.push(current.trim());
       current = s;
     } else {
-      current += s;
+      current = current ? current + ' ' + s : s;
     }
   }
   if (current.trim()) chunks.push(current.trim());
-  return chunks;
+  // If a single sentence exceeded MAX_CHUNK, hard-split at word boundary
+  return chunks.flatMap(c => {
+    if (c.length <= MAX_CHUNK) return [c];
+    const parts: string[] = [];
+    let remaining = c;
+    while (remaining.length > MAX_CHUNK) {
+      let cut = remaining.lastIndexOf(' ', MAX_CHUNK);
+      if (cut <= 0) cut = MAX_CHUNK;
+      parts.push(remaining.slice(0, cut).trim());
+      remaining = remaining.slice(cut).trim();
+    }
+    if (remaining) parts.push(remaining);
+    return parts;
+  });
 }
 
 function extractParagraphs(html: string): string[] {
@@ -42,6 +66,7 @@ function extractParagraphs(html: string): string[] {
 
   function walk(node: any) {
     if (!node) return;
+    if (node.type === 'tag' && ['h1','h2','h3','h4','h5','h6'].includes(node.name)) return;
     if (node.type === 'tag' && ['p', 'div', 'section', 'blockquote'].includes(node.name)) {
       const text = extractText(node).trim();
       if (text.length > 20) {
@@ -67,7 +92,10 @@ function extractParagraphs(html: string): string[] {
   }
 
   // Split any oversized paragraphs into sentence-level chunks
-  return raw.flatMap(splitIntoChunks);
+  // Filter headings (h1-h6 content tends to be short with no sentence-ending punctuation)
+  return raw
+    .filter(t => t.length > 20)
+    .flatMap(splitIntoChunks);
 }
 
 function resolvePath(base: string, relative: string): string {
